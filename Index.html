@@ -1,0 +1,440 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="theme-color" content="#101522">
+<title>Deriv Demo Bot</title>
+<style>
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  padding: 20px;
+  background: #101522;
+  color: #edf2ff;
+  font: 16px -apple-system, BlinkMacSystemFont, sans-serif;
+}
+main { max-width: 650px; margin: auto; }
+h1 { margin-bottom: 8px; }
+p { color: #b9c6df; line-height: 1.5; }
+.card {
+  background: #1b2335;
+  border: 1px solid #33405a;
+  border-radius: 16px;
+  padding: 20px;
+  margin-top: 20px;
+}
+.grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 16px;
+}
+label { display: block; font-size: 14px; }
+input {
+  width: 100%;
+  padding: 12px;
+  margin-top: 6px;
+  background: #101522;
+  color: white;
+  border: 1px solid #475674;
+  border-radius: 8px;
+  font-size: 16px;
+}
+button {
+  width: 100%;
+  padding: 14px;
+  margin-top: 14px;
+  border: none;
+  border-radius: 10px;
+  font-size: 16px;
+  font-weight: bold;
+  cursor: pointer;
+}
+#start { background: #5be4b0; color: #10251c; }
+#stop { background: #ffb5b5; color: #391515; }
+button:disabled { opacity: .4; cursor: default; }
+#status { color: #5be4b0; }
+#pnl { font-size: 26px; }
+pre {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-size: 13px;
+  line-height: 1.6;
+}
+@media (max-width: 480px) {
+  .grid { grid-template-columns: 1fr; }
+}
+</style>
+</head>
+<body>
+<main>
+<h1>Deriv Demo Bot</h1>
+<p>Rise/Fall on Volatility 100. Demo accounts only.</p>
+
+<div class="card">
+  <div class="grid">
+    <label>Registered Deriv app ID
+      <input id="app" inputmode="numeric" autocomplete="off">
+    </label>
+
+    <label>Demo API token
+      <input id="token" type="password" autocomplete="off"
+             autocapitalize="none" spellcheck="false">
+    </label>
+
+    <label>Stake in account currency
+      <input id="stake" type="number" value="1"
+             min="0.01" step="0.01" inputmode="decimal">
+    </label>
+
+    <label>Session loss limit
+      <input id="loss" type="number" value="10"
+             min="0.01" step="0.01" inputmode="decimal">
+    </label>
+
+    <label>Session profit target
+      <input id="target" type="number" value="5"
+             min="0.01" step="0.01" inputmode="decimal">
+    </label>
+
+    <label>Maximum trades
+      <input id="max" type="number" value="20"
+             min="1" max="1000" step="1" inputmode="numeric">
+    </label>
+  </div>
+
+  <button id="start">Start demo bot</button>
+  <button id="stop" disabled>Stop after current trade</button>
+
+  <p id="status" role="status">Idle</p>
+  <p>
+    Keep Safari open and your screen awake while trading.
+    Your token is sent to Deriv and is not saved by this app.
+  </p>
+</div>
+
+<div class="card">
+  <p>Session profit / loss</p>
+  <strong id="pnl">0.00</strong>
+  <pre id="log" role="log"></pre>
+</div>
+
+<p>
+  Example strategy: compares the average of the last 5 ticks
+  with the last 20 ticks, then buys a 5-tick Rise or Fall contract.
+  Profitability is unproven.
+</p>
+</main>
+
+<script>
+"use strict";
+
+const $ = id => document.getElementById(id);
+const pause = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+let running = false;
+let stopping = false;
+
+function log(message) {
+  const lines = $("log").textContent.split("\n").filter(Boolean);
+  lines.push(`${new Date().toLocaleTimeString()}  ${message}`);
+  $("log").textContent = lines.slice(-200).join("\n");
+}
+
+function status(message) {
+  $("status").textContent = message;
+}
+
+class DerivAPI {
+  constructor(appId) {
+    this.pending = new Map();
+    this.nextId = 0;
+    this.socket = new WebSocket(
+      "wss://ws.derivws.com/websockets/v3?app_id=" +
+      encodeURIComponent(appId)
+    );
+
+    this.opened = new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.socket.close();
+        reject(new Error("Connection timed out."));
+      }, 30000);
+
+      this.socket.addEventListener("open", () => {
+        clearTimeout(timer);
+        resolve();
+      }, { once: true });
+
+      this.socket.addEventListener("error", () => {
+        clearTimeout(timer);
+        reject(new Error("Could not connect to Deriv."));
+      }, { once: true });
+
+      this.socket.addEventListener("close", () => {
+        clearTimeout(timer);
+        reject(new Error("Connection closed before opening."));
+      }, { once: true });
+    });
+
+    this.socket.addEventListener("message", event => {
+      let data;
+      try {
+        data = JSON.parse(event.data);
+      } catch {
+        return;
+      }
+
+      const item = this.pending.get(data.req_id);
+      if (!item) return;
+
+      clearTimeout(item.timer);
+      this.pending.delete(data.req_id);
+
+      if (data.error) {
+        item.reject(new Error(data.error.message));
+      } else {
+        item.resolve(data);
+      }
+    });
+
+    this.socket.addEventListener("close", () => {
+      for (const item of this.pending.values()) {
+        clearTimeout(item.timer);
+        item.reject(new Error("Deriv connection closed."));
+      }
+      this.pending.clear();
+    });
+  }
+
+  request(payload) {
+    if (this.socket.readyState !== WebSocket.OPEN) {
+      return Promise.reject(new Error("Connection is not open."));
+    }
+
+    return new Promise((resolve, reject) => {
+      const req_id = ++this.nextId;
+
+      const timer = setTimeout(() => {
+        this.pending.delete(req_id);
+        reject(new Error("Request timed out."));
+      }, 30000);
+
+      this.pending.set(req_id, { resolve, reject, timer });
+
+      try {
+        this.socket.send(JSON.stringify({ ...payload, req_id }));
+      } catch (error) {
+        clearTimeout(timer);
+        this.pending.delete(req_id);
+        reject(error);
+      }
+    });
+  }
+
+  close() {
+    this.socket.close();
+  }
+}
+
+$("stop").onclick = () => {
+  stopping = true;
+  $("stop").disabled = true;
+  status("Stopping — waiting for any purchased contract to finish.");
+};
+
+document.addEventListener("visibilitychange", () => {
+  if (running && document.hidden) {
+    stopping = true;
+    $("stop").disabled = true;
+    log("App moved to background. New trades stopped.");
+  }
+});
+
+$("start").onclick = async () => {
+  if (running) return;
+
+  const appId = $("app").value.trim();
+  const token = $("token").value.trim();
+  const stake = Number($("stake").value);
+  const loss = Number($("loss").value);
+  const target = Number($("target").value);
+  const maxTrades = Number($("max").value);
+
+  if (
+    !/^\d+$/.test(appId) ||
+    !token ||
+    ![stake, loss, target].every(v => Number.isFinite(v) && v > 0) ||
+    !Number.isInteger(maxTrades) ||
+    maxTrades < 1 ||
+    maxTrades > 1000
+  ) {
+    status("Enter an app ID, token, positive amounts, and 1–1000 trades.");
+    return;
+  }
+
+  running = true;
+  stopping = false;
+  $("start").disabled = true;
+  $("stop").disabled = false;
+  document.querySelectorAll("input").forEach(input => {
+    input.disabled = true;
+  });
+
+  $("log").textContent = "";
+  $("pnl").textContent = "0.00";
+
+  let api;
+  let profit = 0;
+  let trades = 0;
+  let lastSignalTick = null;
+
+  try {
+    status("Connecting…");
+    api = new DerivAPI(appId);
+    await api.opened;
+
+    const { authorize } = await api.request({ authorize: token });
+    $("token").value = "";
+
+    if (!authorize.is_virtual) {
+      throw new Error("Only demo accounts are allowed.");
+    }
+
+    const currency = authorize.currency;
+    log(`Connected to demo account. Currency: ${currency}.`);
+
+    while (
+      !stopping &&
+      trades < maxTrades &&
+      profit > -loss &&
+      profit < target
+    ) {
+      status("Reading market prices…");
+
+      const { history } = await api.request({
+        ticks_history: "R_100",
+        end: "latest",
+        count: 20,
+        style: "ticks"
+      });
+
+      if (stopping) break;
+
+      const prices = history.prices.map(Number);
+      if (prices.length < 20 || !prices.every(Number.isFinite)) {
+        throw new Error("Insufficient or invalid price history.");
+      }
+
+      const signalTick = history.times[history.times.length - 1];
+
+      if (signalTick === lastSignalTick) {
+        await pause(2000);
+        continue;
+      }
+
+      const fast = prices.slice(-5).reduce((a, b) => a + b, 0) / 5;
+      const slow = prices.reduce((a, b) => a + b, 0) / 20;
+
+      if (fast === slow) {
+        await pause(2000);
+        continue;
+      }
+
+      const amount = Math.floor(
+        Math.min(stake, loss + profit) * 100 + 1e-8
+      ) / 100;
+
+      if (amount <= 0) break;
+
+      const direction = fast > slow ? "CALL" : "PUT";
+
+      const { proposal } = await api.request({
+        proposal: 1,
+        amount,
+        basis: "stake",
+        contract_type: direction,
+        currency,
+        duration: 5,
+        duration_unit: "t",
+        symbol: "R_100"
+      });
+
+      if (stopping) break;
+
+      lastSignalTick = signalTick;
+      status("Purchasing demo contract…");
+
+      // A purchase is never automatically retried.
+      // A timeout may mean it executed but the reply was lost.
+      const { buy } = await api.request({
+        buy: proposal.id,
+        price: amount
+      });
+
+      trades++;
+
+      log(
+        `Trade ${trades}: ` +
+        `${direction === "CALL" ? "Rise" : "Fall"}, ` +
+        `${amount.toFixed(2)} ${currency}. ` +
+        `Contract: ${buy.contract_id}`
+      );
+
+      while (true) {
+        status(
+          stopping
+            ? "Stopping — waiting for settlement…"
+            : "Waiting for settlement…"
+        );
+
+        const { proposal_open_contract: contract } =
+          await api.request({
+            proposal_open_contract: 1,
+            contract_id: buy.contract_id
+          });
+
+        if (contract.is_sold) {
+          const result = Number(contract.profit);
+
+          if (!Number.isFinite(result)) {
+            throw new Error("Invalid settlement profit.");
+          }
+
+          profit = Math.round((profit + result) * 100) / 100;
+          $("pnl").textContent = `${profit.toFixed(2)} ${currency}`;
+          log(`Settled: ${result.toFixed(2)} ${currency}.`);
+          break;
+        }
+
+        await pause(2000);
+      }
+
+      if (!stopping) await pause(2000);
+    }
+
+    status("Stopped.");
+    log(
+      `Session complete. ${trades} trades. ` +
+      `Profit/loss: ${profit.toFixed(2)} ${currency}.`
+    );
+  } catch (error) {
+    status("Bot halted.");
+    log(`Error: ${error.message}`);
+    log("Check Deriv for an active contract before restarting.");
+  } finally {
+    if (api) api.close();
+
+    running = false;
+    $("token").value = "";
+    $("start").disabled = false;
+    $("stop").disabled = true;
+
+    document.querySelectorAll("input").forEach(input => {
+      input.disabled = false;
+    });
+  }
+};
+</script>
+</body>
+</html>
